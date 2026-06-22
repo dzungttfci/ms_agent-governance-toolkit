@@ -17,6 +17,7 @@ from agent_os.integrations.escalation import (
     EscalationRequest,
     EscalationResult,
     InMemoryApprovalQueue,
+    QuorumConfig,
 )
 
 
@@ -74,12 +75,46 @@ class TestInMemoryApprovalQueue:
         retrieved = queue.get_decision(req.request_id)
         assert retrieved.decision == EscalationDecision.DENY
 
-    def test_double_approve_fails(self):
+    def test_double_approve_same_approver_rejected(self):
         queue = InMemoryApprovalQueue()
         req = EscalationRequest(agent_id="a1", action="x", reason="r")
         queue.submit(req)
-        assert queue.approve(req.request_id) is True
-        assert queue.approve(req.request_id) is False  # Already resolved
+        assert queue.approve(req.request_id, approver="admin") is True
+        assert queue.approve(req.request_id, approver="admin") is False  # duplicate vote
+
+    def test_second_approver_vote_recorded(self):
+        queue = InMemoryApprovalQueue()
+        req = EscalationRequest(agent_id="a1", action="x", reason="r")
+        queue.submit(req)
+        assert queue.approve(req.request_id, approver="admin-a") is True
+        assert queue.approve(req.request_id, approver="admin-b") is True
+        retrieved = queue.get_decision(req.request_id)
+        assert len(retrieved.votes) == 2
+        approvers = [a for a, _, _ in retrieved.votes]
+        assert "admin-a" in approvers
+        assert "admin-b" in approvers
+
+    def test_votes_recorded_on_approve(self):
+        queue = InMemoryApprovalQueue()
+        req = EscalationRequest(agent_id="a1", action="x", reason="r")
+        queue.submit(req)
+        queue.approve(req.request_id, approver="reviewer-1")
+        retrieved = queue.get_decision(req.request_id)
+        assert len(retrieved.votes) == 1
+        approver, verdict, _ = retrieved.votes[0]
+        assert approver == "reviewer-1"
+        assert verdict == "ALLOW"
+
+    def test_votes_recorded_on_deny(self):
+        queue = InMemoryApprovalQueue()
+        req = EscalationRequest(agent_id="a1", action="x", reason="r")
+        queue.submit(req)
+        queue.deny(req.request_id, approver="sec-team")
+        retrieved = queue.get_decision(req.request_id)
+        assert len(retrieved.votes) == 1
+        approver, verdict, _ = retrieved.votes[0]
+        assert approver == "sec-team"
+        assert verdict == "DENY"
 
     def test_approve_nonexistent(self):
         queue = InMemoryApprovalQueue()
@@ -246,3 +281,52 @@ class TestEscalationRequest:
         )
         assert req.agent_id == "a1"
         assert req.action == "deploy"
+
+
+class TestQuorumResolution:
+    def test_quorum_met_resolves_allow(self):
+        queue = InMemoryApprovalQueue()
+        handler = EscalationHandler(
+            backend=queue,
+            timeout_seconds=5,
+            quorum=QuorumConfig(required_approvals=1, total_approvers=1),
+        )
+        request = handler.escalate("agent-1", "action", "reason")
+
+        def approve():
+            time.sleep(0.05)
+            queue.approve(request.request_id, approver="reviewer-1")
+
+        t = threading.Thread(target=approve)
+        t.start()
+        decision = handler.resolve(request.request_id)
+        t.join()
+        assert decision == EscalationDecision.ALLOW
+
+    def test_quorum_not_met_times_out(self):
+        queue = InMemoryApprovalQueue()
+        handler = EscalationHandler(
+            backend=queue,
+            timeout_seconds=0.2,
+            default_action=DefaultTimeoutAction.DENY,
+            quorum=QuorumConfig(required_approvals=2, total_approvers=3),
+        )
+        request = handler.escalate("agent-1", "action", "reason")
+        queue.approve(request.request_id, approver="reviewer-1")
+        decision = handler.resolve(request.request_id)
+        assert decision == EscalationDecision.DENY
+
+    def test_duplicate_approver_does_not_satisfy_quorum(self):
+        queue = InMemoryApprovalQueue()
+        handler = EscalationHandler(
+            backend=queue,
+            timeout_seconds=0.2,
+            default_action=DefaultTimeoutAction.DENY,
+            quorum=QuorumConfig(required_approvals=2, total_approvers=3),
+        )
+        request = handler.escalate("agent-1", "action", "reason")
+        queue.approve(request.request_id, approver="reviewer-1")
+        result = queue.approve(request.request_id, approver="reviewer-1")
+        assert result is False
+        retrieved = queue.get_decision(request.request_id)
+        assert len(retrieved.votes) == 1
